@@ -76,9 +76,22 @@ type BandwidthLimiter struct {
 
 // bucketWrapper wraps a TokenBucket with metadata for cleanup and persistence
 type bucketWrapper struct {
+	mu       sync.Mutex
 	bucket   *TokenBucket
 	lastUsed time.Time
 	key      string // For easier identification
+}
+
+func (w *bucketWrapper) touch() {
+	w.mu.Lock()
+	w.lastUsed = time.Now()
+	w.mu.Unlock()
+}
+
+func (w *bucketWrapper) lastUsedAt() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.lastUsed
 }
 
 // TokenBucket implements the token bucket algorithm for rate limiting
@@ -256,7 +269,7 @@ func (bl *BandwidthLimiter) doCleanup() {
 	// Remove old download buckets
 	bl.buckets.Range(func(key, value interface{}) bool {
 		wrapper := value.(*bucketWrapper)
-		if now.Sub(wrapper.lastUsed) > maxAge {
+		if now.Sub(wrapper.lastUsedAt()) > maxAge {
 			bl.buckets.Delete(key)
 		}
 		return true
@@ -265,7 +278,7 @@ func (bl *BandwidthLimiter) doCleanup() {
 	// Remove old upload buckets
 	bl.uploadBuckets.Range(func(key, value interface{}) bool {
 		wrapper := value.(*bucketWrapper)
-		if now.Sub(wrapper.lastUsed) > maxAge {
+		if now.Sub(wrapper.lastUsedAt()) > maxAge {
 			bl.uploadBuckets.Delete(key)
 		}
 		return true
@@ -322,7 +335,7 @@ func (bl *BandwidthLimiter) saveBuckets() error {
 		state := wrapper.bucket.getState()
 		state.Key = key.(string)
 		state.Type = "download"
-		state.LastUsed = wrapper.lastUsed
+		state.LastUsed = wrapper.lastUsedAt()
 		states = append(states, state)
 		return true
 	})
@@ -333,7 +346,7 @@ func (bl *BandwidthLimiter) saveBuckets() error {
 		state := wrapper.bucket.getState()
 		state.Key = key.(string)
 		state.Type = "upload"
-		state.LastUsed = wrapper.lastUsed
+		state.LastUsed = wrapper.lastUsedAt()
 		states = append(states, state)
 		return true
 	})
@@ -453,22 +466,26 @@ func (bl *BandwidthLimiter) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 	// Apply upload limiting if there's a request body
 	if req.Body != nil && req.ContentLength != 0 {
 		uploadWrapper := bl.getOrCreateUploadBucket(key, limit)
-		uploadWrapper.lastUsed = time.Now()
+		uploadWrapper.touch()
 
 		// Wrap the request body with rate limiting
 		req.Body = &limitedReadCloser{
 			ReadCloser: req.Body,
 			bucket:     uploadWrapper.bucket,
+			ctx:        req.Context(),
+			touch:      uploadWrapper.touch,
 		}
 	}
 
 	// Apply download limiting
 	downloadWrapper := bl.getOrCreateBucket(key, limit)
-	downloadWrapper.lastUsed = time.Now()
+	downloadWrapper.touch()
 
 	lrw := &limitedResponseWriter{
 		ResponseWriter: rw,
 		bucket:         downloadWrapper.bucket,
+		ctx:            req.Context(),
+		touch:          downloadWrapper.touch,
 	}
 
 	// Call the next handler
@@ -566,6 +583,8 @@ func parseForwardedFor(xff string) []string {
 
 // limitedResponseWriter wraps http.ResponseWriter to apply bandwidth limiting
 type limitedResponseWriter struct {
+	ctx   context.Context
+	touch func()
 	http.ResponseWriter
 	bucket *TokenBucket
 }
@@ -580,18 +599,18 @@ func (lrw *limitedResponseWriter) Write(p []byte) (int, error) {
 		// Determine how many bytes to write in this iteration
 		chunkSize := min(int64(len(remaining)), CHUNK_SIZE)
 
-		// Write the chunk
+		// Wait before writing so the last chunk cannot escape the rate limit.
+		if err := waitForTokens(lrw.ctx, lrw.bucket, chunkSize); err != nil {
+			return totalWritten, err
+		}
+		lrw.touch()
 		written, err := lrw.ResponseWriter.Write(remaining[:chunkSize])
 		totalWritten += written
-
 		if err != nil {
 			return totalWritten, err
 		}
-
-		// Wait until we have tokens available
-		for !lrw.bucket.Consume(int64(written)) {
-			// No tokens available, wait a bit
-			time.Sleep(10 * time.Millisecond)
+		if written == 0 {
+			return totalWritten, io.ErrShortWrite
 		}
 
 		remaining = remaining[written:]
@@ -602,27 +621,45 @@ func (lrw *limitedResponseWriter) Write(p []byte) (int, error) {
 
 // limitedReadCloser wraps io.ReadCloser to apply bandwidth limiting on uploads
 type limitedReadCloser struct {
+	ctx   context.Context
+	touch func()
 	io.ReadCloser
 	bucket *TokenBucket
 }
 
 // Read applies bandwidth limiting when reading request data (uploads)
 func (lrc *limitedReadCloser) Read(p []byte) (int, error) {
-	// Limit the read size to apply rate limiting more granularly
+	if err := lrc.ctx.Err(); err != nil {
+		return 0, err
+	}
 	readSize := len(p)
 	if readSize > CHUNK_SIZE {
 		readSize = CHUNK_SIZE
 	}
-
-	// Perform the actual read
 	n, err := lrc.ReadCloser.Read(p[:readSize])
-
-	// Consume tokens based on actual bytes read
 	if n > 0 {
-		for !lrc.bucket.Consume(int64(n)) {
-			// No tokens available, wait a bit
-			time.Sleep(10 * time.Millisecond)
+		if waitErr := waitForTokens(lrc.ctx, lrc.bucket, int64(n)); waitErr != nil {
+			return 0, waitErr
 		}
+		lrc.touch()
 	}
 	return n, err
+}
+
+func waitForTokens(ctx context.Context, bucket *TokenBucket, size int64) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if bucket.Consume(size) {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
