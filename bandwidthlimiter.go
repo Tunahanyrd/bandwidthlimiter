@@ -654,12 +654,8 @@ func waitForTokens(ctx context.Context, bucket *TokenBucket, size int64) error {
 		if bucket.Consume(size) {
 			return nil
 		}
-		timer := time.NewTimer(10 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
+		// Poll cancellation between bounded sleeps. This also avoids retaining
+		// interpreted select-channel state between token-refill retries.
+		time.Sleep(10 * time.Millisecond)
 	}
 }
